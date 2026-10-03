@@ -1,0 +1,66 @@
+name: Build Windows release
+
+# Push a tag like v1.1.0 to build the portable zip + installer and attach them to a GitHub Release.
+# You can also run it manually (Actions tab -> Build Windows release -> Run workflow) to get the
+# files as downloadable build artifacts without publishing a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Generate icon
+        run: python make_icon.py
+
+      - name: Build exe (PyInstaller, folder mode)
+        run: >
+          pyinstaller --noconfirm --clean --windowed --onedir
+          --name "Danevo File Sorter"
+          --icon danevo.ico
+          --version-file version_info.txt
+          --collect-all customtkinter
+          --hidden-import pystray._win32
+          --add-data "danevo.ico;."
+          --add-data "danevo.png;."
+          danevo_file_sorter.py
+
+      - name: Zip portable build
+        run: Compress-Archive -Path "dist/Danevo File Sorter" -DestinationPath "DanevoFileSorter-portable.zip"
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DanevoFileSorter-windows
+          path: |
+            DanevoFileSorter-portable.zip
+            installer/*.exe
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            DanevoFileSorter-portable.zip
+            installer/*.exe
