@@ -49,7 +49,7 @@ except Exception:  # pragma: no cover
     HAS_TRAY = False
 
 APP_NAME = "Danevo File Sorter"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # --------------------------------------------------------------------------
 #  Paths & constants
@@ -152,11 +152,20 @@ _QUALITY = re.compile(
     r"webdl|hdrip|dvdrip|dvdscr|hdtv|hdcam|x264|x265|h 264|h 265|h264|h265|hevc|xvid|divx|aac\d*|"
     r"ac3|dts|ddp\d*|atmos|10bit|remux|repack|extended|unrated|imax|dual audio)\b", re.I)
 _YEAR = re.compile(r"(?<!\d)(19[2-9]\d|20[0-4]\d)(?!\d)")
-_EPISODE = [
+_EP_FULL = [
     (re.compile(r"\bS(\d{1,2})\s?E(\d{1,3})\b", re.I), 1, 2),
     (re.compile(r"\b(\d{1,2})x(\d{2,3})\b", re.I), 1, 2),
     (re.compile(r"\bSeason\s?(\d{1,2})(?:\s?Episode\s?(\d{1,3}))?\b", re.I), 1, 2),
-    (re.compile(r"\bS(\d{1,2})\b(?!\s?E\d)", re.I), 1, None),
+]
+_SEASON_ONLY = [
+    re.compile(r"\bS(\d{1,2})\b(?!\s?E\d)", re.I),
+    re.compile(r"\bSeason\s?(\d{1,2})\b", re.I),
+    re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\s+Season\b", re.I),
+]
+_EP_ONLY = [  # anime style: "Title - 05", "Title Ep05", "Title Episode 5", "Title E05"
+    re.compile(r"\b(?:Episode|Ep)\.?\s?(\d{1,4})\b", re.I),
+    re.compile(r"\bE(\d{2,4})\b", re.I),
+    re.compile(r"\s-\s(\d{1,3}|(?!19\d\d|20[0-4]\d)\d{4})(?:v\d)?(?=\s|$)"),
 ]
 
 
@@ -182,12 +191,31 @@ def parse_media(fname: str):
     s = re.sub(r"\s+", " ", re.sub(r"[\[(][^\])]*[\])]", _brackets, s)).strip()
 
     season = episode = None
-    is_series, cuts = False, []
-    for rx, gs, ge in _EPISODE:
+    cuts = []
+    for rx, gs, ge in _EP_FULL:
         m = rx.search(s)
         if m:
-            is_series, season = True, int(m.group(gs))
-            episode = int(m.group(ge)) if ge and m.group(ge) else None
+            season = int(m.group(gs))
+            episode = int(m.group(ge)) if m.group(ge) else None
+            cuts.append(m.start())
+            break
+    else:  # no S01E02-style marker: look for a season and an episode number separately
+        for rx in _SEASON_ONLY:
+            m = rx.search(s)
+            if m:
+                season = int(m.group(1))
+                cuts.append(m.start())
+                break
+        for rx in _EP_ONLY:
+            m = rx.search(s)
+            if m:
+                episode = int(m.group(1))
+                cuts.append(m.start())
+                break
+    is_series = season is not None or episode is not None
+    for rx in _SEASON_ONLY:  # a stray "S2" / "Season 2" before the real marker also ends the title
+        m = rx.search(s)
+        if m:
             cuts.append(m.start())
             break
     qm = _QUALITY.search(s)
@@ -211,6 +239,8 @@ def parse_media(fname: str):
 
 def media_placeholders(info: dict) -> dict:
     t, y, se, ep = info["title"], info["year"], info["season"], info["episode"]
+    if se is None and ep is not None:
+        se = 1  # anime-style "Title - 05" names carry no season: assume season 1
     return {
         "title": t,
         "title_year": str(y) if y else "",
@@ -288,7 +318,7 @@ class Rule:
             bits.append(f"older than {self.older_days:g} d")
         return "  ·  ".join(bits) or "no conditions"
 
-    def match(self, fname: str, size: int, mtime: float, path: str = ""):
+    def match(self, fname: str, size: int, mtime: float, path: str = "", parse_name: str = ""):
         """Return dict of captured groups if the file matches, else None."""
         if not self.has_conditions():
             return None
@@ -303,7 +333,7 @@ class Rule:
             return None
         groups = {}
         if self.smart:
-            info = parse_media(fname)
+            info = parse_media(parse_name or fname)
             if info is None:
                 return None
             if self.smart == "series" and not info["series"]:
@@ -333,8 +363,18 @@ class Rule:
 
 
 @dataclass
+class Folder:
+    path: str = ""
+    enabled: bool = True
+    depth: int = 0          # 0 = loose files only, 1 = + one level of subfolders, 99 = all subfolders
+    dest_base: str = ""     # "" = create the sorted subfolders inside the folder itself
+
+
+@dataclass
 class Settings:
-    root: str = str(Path.home() / "Downloads")
+    root: str = ""          # legacy single-folder setting (v1.0/1.1), migrated into `folders`
+    folders: list = field(default_factory=lambda: [Folder(str(Path.home() / "Downloads"))])
+    aliases: str = ""       # "name in file = folder name", one per line
     settle_seconds: float = 8
     poll_seconds: float = 4
     unmatched_folder: str = ""
@@ -385,7 +425,19 @@ def load_config() -> Config:
         raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         s_names = {f.name for f in fields(Settings)}
         r_names = {f.name for f in fields(Rule)}
-        cfg.settings = Settings(**{k: v for k, v in raw.get("settings", {}).items() if k in s_names})
+        f_names = {f.name for f in fields(Folder)}
+        kw = {k: v for k, v in raw.get("settings", {}).items() if k in s_names}
+        raw_folders = kw.pop("folders", None) or []
+        legacy_root = kw.get("root", "")
+        st = Settings(**kw)
+        folders = [Folder(**{k: v for k, v in x.items() if k in f_names})
+                   for x in raw_folders if isinstance(x, dict) and x.get("path")]
+        if not folders and legacy_root:
+            folders = [Folder(legacy_root)]
+        if folders:
+            st.folders = folders
+        st.root = ""
+        cfg.settings = st
         rules = [Rule(**{k: v for k, v in r.items() if k in r_names}) for r in raw.get("rules", [])]
         if rules:
             cfg.rules = rules
@@ -410,6 +462,7 @@ class Move:
     rule: str
     action: str = "move"     # "move" | "zip"
     zip_name: str = ""
+    root: str = ""           # base folder the destination is shown relative to
 
 
 def unique_path(p: Path) -> Path:
@@ -429,13 +482,19 @@ class Sorter:
         self.cfg = cfg
         self.lock = threading.RLock()
         self._hash_cache = {}
-        self._index = {}
-        self._index_t = 0.0
-        self._index_root = ""
+        self._indexes = {}       # watched folder -> (time, size index)
+        self._settled = set()    # files already evaluated that need no move: (path, size, mtime_ns)
+        self._sig = None
         self._claimed = {}
+
+    def invalidate(self):
+        self._indexes.clear()
+        self._settled.clear()
+        self._sig = None
 
     # -- destination -------------------------------------------------------
     def _dest_dir(self, root: Path, rule: Rule, path: str, fname: str, mtime: float, groups: dict) -> Path:
+        groups = self._apply_aliases(groups)
         ext = os.path.splitext(fname)[1].lstrip(".")
         dt = datetime.fromtimestamp(mtime)
         nd = date_in_name(fname) or (str(dt.year), f"{dt.month:02d}", f"{dt.day:02d}")
@@ -502,8 +561,9 @@ class Sorter:
         return self._hash_cache[key]
 
     def _size_index(self, root: Path) -> dict:
-        if self._index_root == str(root) and time.time() - self._index_t < 60:
-            return self._index
+        cached = self._indexes.get(str(root))
+        if cached and time.time() - cached[0] < 60:
+            return cached[1]
         idx = {}
         for dp, dn, fn in os.walk(root):
             if Path(dp) == root and DUP_FOLDER in dn:
@@ -516,7 +576,7 @@ class Sorter:
                     continue
                 if size > 0:
                     idx.setdefault(size, []).append(p)
-        self._index, self._index_t, self._index_root = idx, time.time(), str(root)
+        self._indexes[str(root)] = (time.time(), idx)
         return idx
 
     def _find_duplicates(self, root: Path, cands) -> set:
@@ -525,7 +585,7 @@ class Sorter:
         idx = self._size_index(root)
         cset = {c[0] for c in cands}
         dups, kept = set(), {}
-        for path, _name, info in sorted(cands, key=lambda c: c[2].st_mtime):  # oldest is the original
+        for path, _name, info, _parent in sorted(cands, key=lambda c: c[2].st_mtime):  # oldest = original
             size = info.st_size
             if size == 0:
                 continue
@@ -539,81 +599,184 @@ class Sorter:
             kept.setdefault(size, []).append(path)
         return dups
 
+    # -- naming helpers ----------------------------------------------------
+    def _alias_pairs(self):
+        pairs = []
+        for line in self.cfg.settings.aliases.splitlines():
+            parts = re.split(r"\s*(?:->|=|\u2192)\s*", line.strip(), maxsplit=1)
+            if len(parts) == 2 and norm_key(parts[0]) and parts[1].strip():
+                pairs.append((norm_key(parts[0]), parts[1].strip()))
+        return pairs
+
+    def _apply_aliases(self, groups: dict) -> dict:
+        """'Nanatsu no Taizai = The Seven Deadly Sins' renames the detected title."""
+        if "title" not in groups:
+            return groups
+        key = norm_key(groups["title"])
+        for k, name in self._alias_pairs():
+            if k in key:
+                g = dict(groups)
+                g["title"] = name
+                y = g.get("title_year")
+                g["movie"] = f"{name} ({y})" if y else name
+                return g
+        return groups
+
+    def _effective_name(self, name: str, parent_name: str) -> str:
+        """Name used for smart parsing. For files inside a subfolder with a weak name ('01.mkv',
+        'Episode 05.mkv', 'S01E05.mkv') the title and season come from the parent folder."""
+        if not parent_name:
+            return name
+        pi = parse_media(parent_name)
+        if not pi:
+            return name
+        fi = parse_media(name)
+        stem, ext = os.path.splitext(name)
+        if fi is None or fi["title"].replace(" ", "").isdigit():
+            return f"{parent_name} - {stem}{ext}"
+        if fi["series"] and fi["season"] is None and pi["season"] is not None:
+            ep = fi["episode"] if fi["episode"] is not None else 0
+            return f"{fi['title']} S{pi['season']:02d}E{ep:02d}{ext}"
+        return name
+
+    def _cluster_hints(self, cands) -> dict:
+        """Files like 'Show 01.mkv', 'Show 02.mkv', 'Show 03.mkv' in one folder are episodes of one
+        series even without an S01E01 marker. Needs 3+ different numbers; names with a year (movie
+        sequels like 'Toy Story 2 (1999)') are never treated as episodes."""
+        groups = {}
+        for path, name, _info, _parent in cands:
+            pi = parse_media(name)
+            if not pi or pi["series"] or pi["year"]:
+                continue
+            m = re.match(r"^(.*?\D)\s(\d{1,3})$", pi["title"])
+            if m:
+                key = (str(Path(path).parent), norm_key(m.group(1)))
+                groups.setdefault(key, []).append((path, m.group(1).strip(), int(m.group(2))))
+        hints = {}
+        for items in groups.values():
+            if len({n for _, _, n in items}) >= 3:
+                for path, base, n in items:
+                    hints[path] = f"{base} - {n:02d}{os.path.splitext(path)[1]}"
+        return hints
+
     # -- planning ----------------------------------------------------------
+    def _iter_files(self, root: Path, depth: int):
+        skip = {"$recycle.bin", "system volume information", DUP_FOLDER.lower()}
+        stack = [(root, 0)]
+        while stack:
+            cur, lvl = stack.pop()
+            try:
+                with os.scandir(cur) as it:
+                    entries = list(it)
+            except OSError:
+                continue
+            for e in entries:
+                try:
+                    if e.is_file(follow_symlinks=False):
+                        yield e, (cur.name if cur != root else "")
+                    elif (lvl < depth and e.is_dir(follow_symlinks=False)
+                          and not e.name.startswith(".") and e.name.lower() not in skip):
+                        stack.append((Path(e.path), lvl + 1))
+                except OSError:
+                    continue
+
     def plan(self) -> list:
         with self.lock:
-            st = self.cfg.settings
-            root = Path(st.root)
-            out = []
-            if not root.is_dir():
-                return out
-            rules = [r for r in self.cfg.rules if r.enabled and r.target.strip()]
-            now = time.time()
+            sig = json.dumps([asdict(self.cfg.settings), [asdict(r) for r in self.cfg.rules]], sort_keys=True)
+            if sig != self._sig:  # rules/settings changed: re-evaluate everything
+                self._settled.clear()
+                self._indexes.clear()
+                self._sig = sig
+            if len(self._settled) > 200000:
+                self._settled.clear()
             self._claimed = {}
-            cands = []
-            with os.scandir(root) as it:
-                for e in it:
-                    try:
-                        if not e.is_file(follow_symlinks=False):
-                            continue
-                        name = e.name
-                        low = name.lower()
-                        if (name.startswith((".", "~$")) or low in IGNORE_NAMES
-                                or os.path.splitext(low)[1] in PARTIAL_EXT):
-                            continue
-                        info = e.stat()
-                    except OSError:
-                        continue
-                    if now - info.st_mtime < st.settle_seconds:
-                        continue  # probably still being written
-                    cands.append((e.path, name, info))
-
-            dups = self._find_duplicates(root, cands) if st.duplicate_mode == "move" else set()
-            for path, name, info in cands:
-                if path in dups:
-                    out.append(Move(path, str(root / DUP_FOLDER), "(duplicate)"))
-                    continue
-                dest, rule_name, action = None, "", "move"
-                for r in rules:
-                    g = r.match(name, info.st_size, info.st_mtime, path)
-                    if g is not None:
-                        dest = self._dest_dir(root, r, path, name, info.st_mtime, g)
-                        rule_name, action = r.name, r.action
-                        break
-                if dest is None and st.unmatched_folder.strip():
-                    parts = [safe_part(p) for p in re.split(r"[\\/]+", st.unmatched_folder)]
-                    dest = root.joinpath(*[p for p in parts if p])
-                    rule_name = "(unmatched)"
-                if dest is None or dest == root:
-                    continue
-                if action == "zip":
-                    if dest.suffix.lower() != ".zip":
-                        dest = dest.with_name(dest.name + ".zip")
-                    out.append(Move(path, str(dest.parent), rule_name, "zip", dest.name))
-                else:
-                    out.append(Move(path, str(dest), rule_name))
+            out = []
+            for f in self.cfg.settings.folders:
+                if f.enabled and f.path and Path(f.path).is_dir():
+                    out.extend(self._plan_folder(f))
             out.sort(key=lambda m: m.src.lower())
             return out
+
+    def _plan_folder(self, f: Folder) -> list:
+        st = self.cfg.settings
+        root = Path(f.path)
+        base = Path(f.dest_base) if f.dest_base.strip() else root
+        rules = [r for r in self.cfg.rules if r.enabled and r.target.strip()]
+        now = time.time()
+        cands, out = [], []
+        for e, parent_name in self._iter_files(root, f.depth):
+            try:
+                name = e.name
+                low = name.lower()
+                if (name.startswith((".", "~$")) or low in IGNORE_NAMES
+                        or os.path.splitext(low)[1] in PARTIAL_EXT):
+                    continue
+                info = e.stat()
+            except OSError:
+                continue
+            if (e.path, info.st_size, info.st_mtime_ns) in self._settled:
+                continue
+            if now - info.st_mtime < st.settle_seconds:
+                continue  # probably still being written
+            cands.append((e.path, name, info, parent_name))
+
+        dups = self._find_duplicates(root, cands) if st.duplicate_mode == "move" else set()
+        hints = self._cluster_hints(cands)
+        for path, name, info, parent_name in cands:
+            key = (path, info.st_size, info.st_mtime_ns)
+            if path in dups:
+                out.append(Move(path, str(base / DUP_FOLDER), "(duplicate)", root=str(base)))
+                continue
+            parse_name = hints.get(path) or self._effective_name(name, parent_name)
+            dest, rule_name, action = None, "", "move"
+            for r in rules:
+                g = r.match(name, info.st_size, info.st_mtime, path, parse_name)
+                if g is not None:
+                    dest = self._dest_dir(base, r, path, name, info.st_mtime, g)
+                    rule_name, action = r.name, r.action
+                    break
+            if dest is None and st.unmatched_folder.strip():
+                parts = [safe_part(p) for p in re.split(r"[\\/]+", st.unmatched_folder)]
+                dest = base.joinpath(*[p for p in parts if p])
+                rule_name = "(unmatched)"
+            parent = Path(path).parent
+            if dest is None or (action == "move" and dest == parent):
+                self._settled.add(key)  # nothing to do for this file until rules/settings change
+                continue
+            if action == "zip":
+                if dest.suffix.lower() != ".zip":
+                    dest = dest.with_name(dest.name + ".zip")
+                if dest.parent == parent:  # already inside the archive folder
+                    self._settled.add(key)
+                    continue
+                out.append(Move(path, str(dest.parent), rule_name, "zip", dest.name, str(base)))
+            else:
+                out.append(Move(path, str(dest), rule_name, root=str(base)))
+        return out
 
     def explain(self, fname: str):
         """What would happen to a file with this name? -> (rule name, relative destination) or None."""
         with self.lock:
-            root, now, self._claimed = Path(self.cfg.settings.root), time.time(), {}
+            folders = [f for f in self.cfg.settings.folders if f.enabled] or self.cfg.settings.folders
+            f = folders[0] if folders else Folder(str(Path.home() / "Downloads"))
+            base = Path(f.dest_base) if f.dest_base.strip() else Path(f.path)
+            now, self._claimed = time.time(), {}
             for r in self.cfg.rules:
                 if not (r.enabled and r.target.strip()):
                     continue
                 g = r.match(fname, 50 * 1048576, now, fname)
                 if g is not None:
-                    dest = self._dest_dir(root, r, fname, fname, now, g)
+                    dest = self._dest_dir(base, r, fname, fname, now, g)
                     if r.action == "zip":
-                        return r.name, f"{self._rel(str(dest))}.zip (ZIP)"
-                    return r.name, self._rel(str(dest)) + "/"
+                        return r.name, f"{self._rel(str(dest), str(base))}.zip (ZIP)"
+                    return r.name, self._rel(str(dest), str(base)) + "/"
             return None
 
     # -- execution ---------------------------------------------------------
-    def _rel(self, d: str) -> str:
+    @staticmethod
+    def _rel(d: str, root: str = "") -> str:
         try:
-            return str(Path(d).relative_to(self.cfg.settings.root))
+            return str(Path(d).relative_to(root)) if root else d
         except ValueError:
             return d
 
@@ -640,13 +803,14 @@ class Sorter:
                         src.unlink()
                         done.append({"src": str(src), "dst": str(zp), "entry": arc, "mtime": mtime})
                         if log:
-                            log(f"▣ {src.name}  →  zipped into {self._rel(str(zp))}   [{m.rule}]")
+                            log(f"▣ {src.name}  →  zipped into {self._rel(str(zp), m.root)}   [{m.rule}]")
                     else:
                         dst = unique_path(Path(m.dest_dir) / src.name)
                         shutil.move(str(src), str(dst))
                         done.append({"src": str(src), "dst": str(dst)})
                         if log:
-                            log(f"✓ {src.name}  →  {self._rel(m.dest_dir)}   [{m.rule}]")
+                            log(f"✓ {src.name}  →  {self._rel(m.dest_dir, m.root)}   [{m.rule}]")
+                    self._prune(src.parent)  # a subfolder we just emptied is removed
                 except Exception as exc:
                     failed += 1
                     if log:
@@ -655,7 +819,7 @@ class Sorter:
                     progress(i / total)
             if done:
                 self._push_history(done)
-                self._index_t = 0  # force a fresh duplicate index next time
+                self._indexes.clear()  # force a fresh duplicate index next time
         return len(done), failed
 
     # -- history / undo ----------------------------------------------------
@@ -671,9 +835,19 @@ class Sorter:
         hist.append({"time": datetime.now().isoformat(timespec="seconds"), "moves": batch})
         HISTORY_FILE.write_text(json.dumps(hist[-MAX_HISTORY:]), encoding="utf-8")
 
+    def _roots(self):
+        roots = []
+        for f in self.cfg.settings.folders:
+            if f.path:
+                roots.append(Path(f.path))
+            if f.dest_base.strip():
+                roots.append(Path(f.dest_base))
+        return roots
+
     def _prune(self, d: Path):
-        root = Path(self.cfg.settings.root)
-        while d != root and root in d.parents:
+        """Remove empty folders, but only inside (never including) the managed folders."""
+        roots = self._roots()
+        while d not in roots and any(r in d.parents for r in roots):
             try:
                 d.rmdir()
             except OSError:
@@ -726,7 +900,7 @@ class Sorter:
                     if log:
                         log(f"✗ undo {src.name}: {exc}")
             HISTORY_FILE.write_text(json.dumps(hist), encoding="utf-8")
-            self._index_t = 0
+            self.invalidate()
             return restored
 
 
@@ -974,10 +1148,12 @@ class App(ctk.CTk):
         self.content.grid(row=0, column=1, sticky="nsew", padx=28, pady=24)
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(0, weight=1)
-        self.pages = {"Rules": self._build_rules_page(), "Preview": self._build_preview_page(),
+        self.pages = {"Rules": self._build_rules_page(), "Folders": self._build_folders_page(),
+                      "Preview": self._build_preview_page(),
                       "Activity": self._build_activity_page(), "Settings": self._build_settings_page()}
         self.show("Rules")
         self.refresh_rules()
+        self.refresh_folders()
         self.after(150, self._poll)
         self.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -1005,7 +1181,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(sb, text="FILE SORTER", text_color=MUTED, font=ctk.CTkFont(size=12, weight="bold")).pack(
             anchor="w", padx=28, pady=(0, 28))
         self.nav = {}
-        for name, icon in (("Rules", "☰"), ("Preview", "◉"), ("Activity", "≋"), ("Settings", "⚙")):
+        for name, icon in (("Rules", "☰"), ("Folders", "▤"), ("Preview", "◉"), ("Activity", "≋"), ("Settings", "⚙")):
             b = ctk.CTkButton(sb, text=f"  {icon}   {name}", anchor="w", height=44, corner_radius=12,
                               fg_color="transparent", hover_color="#1a1e2b", text_color="#cfd4e4",
                               font=ctk.CTkFont(size=15), command=lambda n=name: self.show(n))
@@ -1160,6 +1336,115 @@ class App(ctk.CTk):
             self.cfg.rules[:] = default_rules()
             self._commit()
 
+    # ---- Folders page ---------------------------------------------------
+    DEPTHS = (("Loose files only", 0), ("+ 1 level of subfolders", 1), ("All subfolders", 99))
+
+    def _build_folders_page(self):
+        page = ctk.CTkFrame(self.content, fg_color="transparent")
+        right = self._page_header(page, "Folders", "Every folder here is sorted with the same ranked rules.")
+        self._btn(right, "＋  Add folder", self.add_folder, primary=True).pack(side="right")
+        self.folder_list = ctk.CTkScrollableFrame(page, fg_color="transparent")
+        self.folder_list.pack(fill="both", expand=True, pady=(18, 0))
+        return page
+
+    def refresh_folders(self):
+        for w in self.folder_list.winfo_children():
+            w.destroy()
+        folders = self.cfg.settings.folders
+        if not folders:
+            ctk.CTkLabel(self.folder_list, text="No folders yet - press “Add folder”.", text_color=MUTED).pack(
+                pady=40)
+        by_depth = {d: label for label, d in self.DEPTHS}
+        for i, f in enumerate(folders):
+            ok = Path(f.path).is_dir()
+            card = ctk.CTkFrame(self.folder_list, corner_radius=14, fg_color=CARD if f.enabled else CARD_OFF)
+            card.pack(fill="x", pady=5, padx=2)
+            card.grid_columnconfigure(1, weight=1)
+            sw = ctk.CTkSwitch(card, text="", width=44, progress_color=ACCENT,
+                               command=lambda idx=i: self._toggle_folder(idx))
+            sw.grid(row=0, column=0, rowspan=2, padx=(16, 6), pady=16)
+            if f.enabled:
+                sw.select()
+            title = (Path(f.path).name or f.path) + ("" if ok else "    ⚠ folder not found")
+            ctk.CTkLabel(card, text=title, anchor="w", text_color="#ffffff" if f.enabled else MUTED,
+                         font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=1, sticky="ew", pady=(12, 0))
+            sub = f.path + (f"     →  sorted into  {f.dest_base}" if f.dest_base.strip() else "")
+            ctk.CTkLabel(card, text=sub, anchor="w", text_color=MUTED, font=ctk.CTkFont(size=12),
+                         wraplength=480, justify="left").grid(row=1, column=1, sticky="ew", pady=(0, 12))
+            ctl = ctk.CTkFrame(card, fg_color="transparent")
+            ctl.grid(row=0, column=2, rowspan=2, padx=12)
+            var = ctk.StringVar(value=by_depth.get(f.depth, self.DEPTHS[2][0] if f.depth > 1 else self.DEPTHS[0][0]))
+            ctk.CTkOptionMenu(ctl, values=[l for l, _ in self.DEPTHS], variable=var, width=190, height=34,
+                              fg_color="#232839", button_color=ACCENT, button_hover_color=ACCENT_HOVER,
+                              command=lambda v, idx=i: self._set_folder_depth(idx, v)).pack(side="left", padx=(0, 6))
+            ctk.CTkButton(ctl, text="Into ✓" if f.dest_base.strip() else "Into…", width=70, height=34,
+                          corner_radius=10, fg_color="#232839", hover_color="#30364b",
+                          command=lambda idx=i: self._set_folder_base(idx)).pack(side="left", padx=2)
+            ctk.CTkButton(ctl, text="✕", width=34, height=34, corner_radius=10, fg_color="#232839",
+                          hover_color="#7a2a35", command=lambda idx=i: self._remove_folder(idx)).pack(
+                side="left", padx=2)
+
+    def _save_folders(self):
+        save_config(self.cfg)
+        self.refresh_folders()
+
+    def add_folder(self):
+        d = filedialog.askdirectory(title="Choose a folder to organise")
+        if not d:
+            return
+        p = Path(d)
+        if p == Path.home() or p.parent == p:
+            messagebox.showerror("Folder not allowed", "Please choose a specific folder, not your whole "
+                                                       "home folder or a drive root.")
+            return
+        if any(Path(x.path) == p for x in self.cfg.settings.folders):
+            self.toast("That folder is already in the list")
+            return
+        self.cfg.settings.folders.append(Folder(str(p)))
+        self._save_folders()
+        self.toast(f"Added {p.name}")
+
+    def _toggle_folder(self, i):
+        f = self.cfg.settings.folders[i]
+        f.enabled = not f.enabled
+        self._save_folders()
+
+    def _set_folder_depth(self, i, label):
+        depth = dict(self.DEPTHS)[label]
+        if depth and not messagebox.askyesno(
+                "Include subfolders",
+                "With this option files are also moved OUT of subfolders (for example a folder full of "
+                "episodes) and the emptied subfolder is removed.\n\nUse Preview first to see what will "
+                "move. Continue?"):
+            self.refresh_folders()
+            return
+        self.cfg.settings.folders[i].depth = depth
+        self._save_folders()
+
+    def _set_folder_base(self, i):
+        f = self.cfg.settings.folders[i]
+        if f.dest_base.strip() and messagebox.askyesno(
+                "Sort into", f"Sorted subfolders are currently created in:\n{f.dest_base}\n\n"
+                             "Yes = clear it (sort inside the folder itself)\nNo = choose a different folder"):
+            f.dest_base = ""
+            self._save_folders()
+            return
+        d = filedialog.askdirectory(title="Where should the sorted subfolders (TV Series, Movies…) be created?")
+        if d:
+            f.dest_base = d
+            self._save_folders()
+
+    def _remove_folder(self, i):
+        f = self.cfg.settings.folders[i]
+        if messagebox.askyesno("Remove folder", f"Stop organising\n{f.path}\n\n(Your files are not touched.)"):
+            del self.cfg.settings.folders[i]
+            self._save_folders()
+
+    def _open_first_folder(self):
+        fs = [f for f in self.cfg.settings.folders if f.enabled] or self.cfg.settings.folders
+        if fs:
+            open_folder(fs[0].path)
+
     # ---- Preview page ---------------------------------------------------
     def _build_preview_page(self):
         page = ctk.CTkFrame(self.content, fg_color="transparent")
@@ -1186,9 +1471,9 @@ class App(ctk.CTk):
         box = self.preview_box
         box.configure(state="normal")
         box.delete("1.0", "end")
-        root = self.cfg.settings.root
+        n_folders = len([f for f in self.cfg.settings.folders if f.enabled])
         for m in self.pending[:500]:
-            dest = self.sorter._rel(m.dest_dir)
+            dest = self.sorter._rel(m.dest_dir, m.root)
             if m.action == "zip":
                 dest = f"{dest}/{m.zip_name}  (zip)"
             else:
@@ -1199,7 +1484,8 @@ class App(ctk.CTk):
         if not self.pending:
             box.insert("end", "Nothing to sort - everything already matches your rules ✨")
         box.configure(state="disabled")
-        self.preview_info.configure(text=f"{len(self.pending)} file(s) would be handled in  {root}")
+        self.preview_info.configure(
+            text=f"{len(self.pending)} file(s) would be handled across {n_folders} folder(s)")
         self.progress.set(0)
 
     def sort_now(self):
@@ -1236,7 +1522,7 @@ class App(ctk.CTk):
     def _build_activity_page(self):
         page = ctk.CTkFrame(self.content, fg_color="transparent")
         right = self._page_header(page, "Activity", "Everything the sorter has done this session.")
-        self._btn(right, "Open folder", lambda: open_folder(self.cfg.settings.root)).pack(side="right",
+        self._btn(right, "Open folder", self._open_first_folder).pack(side="right",
                                                                                       padx=(8, 0))
         self._btn(right, "↩  Undo last batch", self.undo).pack(side="right")
         self.log_box = ctk.CTkTextbox(page, fg_color=CARD, corner_radius=14,
@@ -1282,12 +1568,20 @@ class App(ctk.CTk):
                               command=self._browse).pack(side="left", padx=(8, 0))
             self.set_entries[key] = e
 
-        row("Folder to organise", "root", st.root, browse=True)
         row("Settle time (seconds)", "settle_seconds", st.settle_seconds,
             hint="Files modified more recently than this are skipped (protects active downloads).")
         row("Watch interval (seconds)", "poll_seconds", st.poll_seconds)
         row("Folder for unmatched files", "unmatched_folder", st.unmatched_folder,
             hint="Leave empty to keep unmatched files where they are, or e.g. “Other”.")
+
+        ctk.CTkLabel(card, text="Title aliases", font=ctk.CTkFont(size=14, weight="bold")).pack(
+            anchor="w", padx=22, pady=(18, 0))
+        ctk.CTkLabel(card, text="One per line:  name in the file = folder name   "
+                                "(e.g.  Nanatsu no Taizai = The Seven Deadly Sins)", text_color=MUTED,
+                     font=ctk.CTkFont(size=12)).pack(anchor="w", padx=22)
+        self.alias_box = ctk.CTkTextbox(card, height=90, fg_color="#12141c", corner_radius=10)
+        self.alias_box.pack(fill="x", padx=22, pady=(6, 0))
+        self.alias_box.insert("1.0", st.aliases)
 
         ctk.CTkLabel(card, text="Duplicate files", font=ctk.CTkFont(size=14, weight="bold")).pack(
             anchor="w", padx=22, pady=(18, 0))
@@ -1316,22 +1610,10 @@ class App(ctk.CTk):
             anchor="w", padx=22, pady=(14, 22))
         return page
 
-    def _browse(self):
-        d = filedialog.askdirectory(initialdir=self.cfg.settings.root)
-        if d:
-            e = self.set_entries["root"]
-            e.delete(0, "end")
-            e.insert(0, d)
-
     def save_settings(self):
         try:
             st = self.cfg.settings
-            root = self.set_entries["root"].get().strip()
-            if not Path(root).is_dir():
-                raise ValueError("That folder doesn't exist.")
-            if Path(root) == Path.home():
-                raise ValueError("Please don't point the sorter at your whole home folder.")
-            st.root = root
+            st.aliases = self.alias_box.get("1.0", "end").strip()
             st.settle_seconds = max(0.0, float(self.set_entries["settle_seconds"].get() or 0))
             st.poll_seconds = max(1.0, float(self.set_entries["poll_seconds"].get() or 4))
             st.unmatched_folder = self.set_entries["unmatched_folder"].get().strip()
@@ -1343,7 +1625,7 @@ class App(ctk.CTk):
         except Exception as exc:
             messagebox.showerror("Invalid settings", str(exc))
             return
-        self.sorter._index_t = 0
+        self.sorter.invalidate()
         save_config(self.cfg)
         self.toast("Settings saved")
 

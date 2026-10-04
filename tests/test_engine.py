@@ -14,7 +14,7 @@ def env(tmp_path, monkeypatch):
     root = tmp_path / "dl"
     root.mkdir()
     cfg = d.Config(rules=d.default_rules())
-    cfg.settings.root = str(root)
+    cfg.settings.folders = [d.Folder(str(root))]
     cfg.settings.settle_seconds = 0
     return root, cfg, d.Sorter(cfg)
 
@@ -29,8 +29,8 @@ def make(root, name, data=None, age_days=0):
     return p
 
 
-def dests(sorter):
-    return {os.path.basename(m.src): os.path.relpath(m.dest_dir, sorter.cfg.settings.root).replace("\\", "/")
+def dests(sorter, rel_to=None):
+    return {os.path.basename(m.src): os.path.relpath(m.dest_dir, rel_to or m.root).replace("\\", "/")
             for m in sorter.plan()}
 
 
@@ -149,3 +149,124 @@ def test_explain(env):
     rule, dest = s.explain("Breaking.Bad.S02E07.1080p.mkv")
     assert rule.startswith("TV series") and dest.endswith("Breaking Bad/Season 02/")
     assert s.explain("random.xyz") is None
+
+
+# ---- anime-style names ------------------------------------------------------
+@pytest.mark.parametrize("name,title,season,episode", [
+    ("The Seven Deadly Sins - 05.mkv", "The Seven Deadly Sins", None, 5),
+    ("[SubsPlease] Nanatsu no Taizai - 05 (1080p) [ABCD1234].mkv", "Nanatsu no Taizai", None, 5),
+    ("Seven.Deadly.Sins.Ep05.720p.mkv", "Seven Deadly Sins", None, 5),
+    ("The Seven Deadly Sins S2 - 05.mkv", "The Seven Deadly Sins", 2, 5),
+    ("The Seven Deadly Sins 2nd Season - 07v2.mkv", "The Seven Deadly Sins", 2, 7),
+])
+def test_parse_anime(name, title, season, episode):
+    info = d.parse_media(name)
+    assert (info["title"], info["season"], info["episode"]) == (title, season, episode)
+    assert info["series"]
+
+
+def test_anime_files_get_series_folder_with_default_season(env):
+    root, cfg, s = env
+    make(root, "[Group] The Seven Deadly Sins - 01 [1080p].mkv")
+    make(root, "[Group] The Seven Deadly Sins - 02 [1080p].mkv")
+    r = dests(s)
+    assert set(r.values()) == {"TV Series/The Seven Deadly Sins/Season 01"}
+
+
+# ---- subfolders (the "folder full of episodes" case) ------------------------
+def test_subfolders_ignored_by_default(env):
+    root, cfg, s = env
+    make(root, "Seven Deadly Sins/The Seven Deadly Sins - 01.mkv")
+    assert dests(s) == {}
+
+
+def test_subfolder_episodes_are_regrouped_and_emptied_folder_removed(env):
+    root, cfg, s = env
+    cfg.settings.folders[0].depth = 1
+    for n in range(1, 4):
+        make(root, f"Seven Deadly Sins/The Seven Deadly Sins - {n:02d}.mkv")
+    moves = s.plan()
+    assert {os.path.relpath(m.dest_dir, root).replace("\\", "/") for m in moves} == {
+        "TV Series/The Seven Deadly Sins/Season 01"}
+    s.execute(moves)
+    assert len(list((root / "TV Series" / "The Seven Deadly Sins" / "Season 01").iterdir())) == 3
+    assert not (root / "Seven Deadly Sins").exists()
+    assert s.plan() == []  # organised files are left alone on the next scan
+    assert s.undo_last() == 3
+    assert (root / "Seven Deadly Sins" / "The Seven Deadly Sins - 02.mkv").exists()
+    assert not (root / "TV Series").exists()
+
+
+def test_weak_filenames_borrow_title_and_season_from_parent_folder(env):
+    root, cfg, s = env
+    cfg.settings.folders[0].depth = 1
+    make(root, "The Seven Deadly Sins S2 [1080p]/01.mkv")
+    make(root, "The Seven Deadly Sins S2 [1080p]/Episode 02.mkv")
+    make(root, "The Seven Deadly Sins S2 [1080p]/S02E03.mkv")
+    assert set(dests(s).values()) == {"TV Series/The Seven Deadly Sins/Season 02"}
+
+
+def test_numbered_episodes_without_markers_cluster_into_a_series(env):
+    root, cfg, s = env
+    for n in (1, 2, 3):
+        make(root, f"Seven Deadly Sins {n:02d}.mkv")
+    assert set(dests(s).values()) == {"TV Series/Seven Deadly Sins/Season 01"}
+
+
+def test_movie_sequels_with_years_are_not_treated_as_episodes(env):
+    root, cfg, s = env
+    for n, y in ((1, 1995), (2, 1999), (3, 2010)):
+        make(root, f"Toy Story {n} ({y}).mkv")
+    assert all(v.startswith("Movies/") for v in dests(s).values())
+
+
+def test_title_alias(env):
+    root, cfg, s = env
+    cfg.settings.aliases = "Nanatsu no Taizai = The Seven Deadly Sins"
+    make(root, "[SubsPlease] Nanatsu no Taizai - 05 (1080p).mkv")
+    assert dests(s)["[SubsPlease] Nanatsu no Taizai - 05 (1080p).mkv"] == "TV Series/The Seven Deadly Sins/Season 01"
+
+
+# ---- multiple folders -------------------------------------------------------
+def test_multiple_folders_and_destination_base(env, tmp_path):
+    root, cfg, s = env
+    other = tmp_path / "desktop"
+    other.mkdir()
+    library = tmp_path / "library"
+    cfg.settings.folders.append(d.Folder(str(other), dest_base=str(library)))
+    make(root, "report.pdf")
+    make(other, "setup.exe")
+    moves = {os.path.basename(m.src): m for m in s.plan()}
+    assert os.path.dirname(moves["report.pdf"].dest_dir).startswith(str(root))
+    assert moves["setup.exe"].dest_dir == str(library / "Installers")
+    s.execute(list(moves.values()))
+    assert (library / "Installers" / "setup.exe").exists()
+    assert not (library).parent.joinpath("desktop", "Installers").exists()
+
+
+def test_disabled_folder_is_skipped(env, tmp_path):
+    root, cfg, s = env
+    other = tmp_path / "other"
+    other.mkdir()
+    cfg.settings.folders.append(d.Folder(str(other), enabled=False))
+    make(other, "report.pdf")
+    assert dests(s) == {}
+
+
+def test_settled_files_are_rechecked_after_rules_change(env):
+    root, cfg, s = env
+    make(root, "weird.xyz")
+    assert s.plan() == []
+    cfg.rules.insert(0, d.Rule("xyz", True, "xyz", target="Strange"))
+    assert dests(s)["weird.xyz"] == "Strange"
+
+
+# ---- config migration -------------------------------------------------------
+def test_legacy_single_root_config_is_migrated(tmp_path, monkeypatch):
+    import json
+    cfgfile = tmp_path / "config.json"
+    cfgfile.write_text(json.dumps({"settings": {"root": str(tmp_path / "old")}, "rules": []}))
+    monkeypatch.setattr(d, "CONFIG_FILE", cfgfile)
+    cfg = d.load_config()
+    assert [f.path for f in cfg.settings.folders] == [str(tmp_path / "old")]
+    assert cfg.settings.root == ""

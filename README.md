@@ -3,10 +3,18 @@
 A rule-based file organiser with a modern dark interface. Point it at a messy folder (your Downloads, for
 example), describe how you want things sorted, and let it keep the folder tidy automatically from then on.
 
+![Rules](docs/screenshot-rules.png)
+
+- **Multiple folders** - organise Downloads, Desktop and more at once. Each folder can include subfolders
+  (a folder full of episodes is regrouped and the emptied folder removed) and can sort *into* a separate
+  library folder.
 - **Ranked rules** - the first matching rule wins, so you control priority (drag the number or use ▲ ▼).
 - **Sorts by name, not just extension** - a smart name parser groups a movie, its subtitles and its
   release-style variants under one title (`Inception.2010.1080p.BluRay.x264.mkv` +
-  `Inception.2010.eng.srt` -> `Movies/Inception (2010)/`).
+  `Inception.2010.eng.srt` -> `Movies/Inception (2010)/`). It understands `S01E02`, `1x02`, `Season 2`,
+  anime-style `Title - 05` / `Ep05`, `[SubsPlease]` tags, and borrows the title from the parent folder
+  when files are just called `01.mkv`. Title aliases map alternate names to one folder
+  (`Nanatsu no Taizai = The Seven Deadly Sins`).
 - **Rich conditions** - extension, content type (detected from the file's bytes), name keywords, regex,
   date in the file name, min/max size, minimum age. All conditions on a rule must match.
 - **Smart destinations** - placeholders such as `{title}`, `{season}`, `{movie}`, `{year}`, `{ext}`,
@@ -32,6 +40,20 @@ without them the app still works and simply closes normally.
 Prefer a ready-made app? Grab the installer or portable zip from the
 [Releases](../../releases) page.
 
+## Folders
+
+Add as many folders as you like on the **Folders** page. For each one choose:
+
+| Option | Meaning |
+|---|---|
+| Loose files only / + 1 level / All subfolders | whether files inside subfolders are sorted too (off by default, and Preview first!) |
+| **Into…** | create `TV Series`, `Movies`… in a separate library folder instead of inside the watched folder |
+| Switch | pause one folder without removing it |
+
+Files that are already where the rules want them are left alone, so scanning subfolders is safe to repeat.
+
+![Folders](docs/screenshot-folders.png)
+
 ## How rules work
 
 Rules are checked top to bottom; the first enabled rule that matches a file decides where it goes.
@@ -50,12 +72,21 @@ Destinations are folders inside the watched folder (or absolute paths), e.g. `TV
 A rule can also **add to a ZIP** instead of moving (destination `Old Files/{year}` -> `Old Files/2026.zip`).
 Existing folders are reused even when their casing or punctuation differs (`breaking bad` = `Breaking.Bad`).
 
+Name-based grouping details:
+- Episodes with no season marker (`Title - 05`) default to `Season 01`; edit the destination to
+  `TV Series/{title}` if you prefer no season folders.
+- Three or more files in a folder named `Show 01`, `Show 02`, `Show 03` are recognised as episodes even
+  without markers (names with a year, like movie sequels, are never treated as episodes).
+- Preview shows exactly where everything would go:
+
+![Preview](docs/screenshot-preview.png)
+
 Settings and rules live in `~/.danevo_file_sorter/` (`config.json`, `history.json`).
 
 ## Build the Windows app
 
 See [BUILDING.md](BUILDING.md) for the one-click `build.bat`, the Inno Setup installer, and troubleshooting.
-Pushing a version tag (`git tag v1.1.0 && git push origin v1.1.0`) builds and publishes both automatically
+Pushing a version tag (`git tag v1.2.0 && git push origin v1.2.0`) builds and publishes both automatically
 through GitHub Actions.
 
 ## Development
@@ -76,6 +107,7 @@ build.bat               local Windows build
 installer.iss           Inno Setup installer script
 version_info.txt        Windows file properties
 tests/                  headless engine tests
+docs/                   screenshots
 .github/workflows/      CI tests + Windows release build
 ```
 
