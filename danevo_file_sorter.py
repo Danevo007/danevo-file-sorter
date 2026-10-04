@@ -49,7 +49,7 @@ except Exception:  # pragma: no cover
     HAS_TRAY = False
 
 APP_NAME = "Danevo File Sorter"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # --------------------------------------------------------------------------
 #  Paths & constants
@@ -256,6 +256,23 @@ def norm_key(name: str) -> str:
     return re.sub(r"[^0-9a-z]+", "", k)
 
 
+_GROUP_NOISE = re.compile(
+    r"(?:[ -]*(?:\(\d+\)|\[\d+\]|copy(?: \d+)?|(?:part|pt|vol|cd|disc)[ -]?\d+|v\d+(?: \d+)*|\d+(?: \d+)*))+$",
+    re.I)
+
+
+def group_core(name: str) -> str:
+    """The 'family name' of a file: extension, copy markers, part/volume numbers, versions and trailing
+    numbers/dates removed.  'MyGame.part2.rar', 'MyGame (1).zip', 'MyGame_v1.2.zip' -> 'MyGame'."""
+    stem = re.sub(r"\.tar$", "", os.path.splitext(name)[0], flags=re.I)
+    s = re.sub(r"\s+", " ", re.sub(r"[._]+", " ", stem)).strip()
+    prev = None
+    while prev != s:
+        prev = s
+        s = _GROUP_NOISE.sub("", s).strip(" -_.")
+    return s
+
+
 # --------------------------------------------------------------------------
 #  Data model
 # --------------------------------------------------------------------------
@@ -303,7 +320,8 @@ class Rule:
             bits.append("type: " + self.kind.strip())
         if self.smart:
             bits.append({"series": "name: TV episode", "movie": "name: movie",
-                         "title": "name: group by title"}.get(self.smart, "name pattern"))
+                         "title": "name: group by title",
+                         "group": "name: shared name"}.get(self.smart, "name pattern"))
         if self.keywords.strip():
             bits.append("name has: " + self.keywords.strip())
         if self.regex.strip():
@@ -318,7 +336,8 @@ class Rule:
             bits.append(f"older than {self.older_days:g} d")
         return "  ·  ".join(bits) or "no conditions"
 
-    def match(self, fname: str, size: int, mtime: float, path: str = "", parse_name: str = ""):
+    def match(self, fname: str, size: int, mtime: float, path: str = "", parse_name: str = "",
+              group: str = ""):
         """Return dict of captured groups if the file matches, else None."""
         if not self.has_conditions():
             return None
@@ -332,7 +351,11 @@ class Rule:
         if self.name_date and date_in_name(fname) is None:
             return None
         groups = {}
-        if self.smart:
+        if self.smart == "group":
+            if not group:
+                return None  # no other file shares this name
+            groups.update({"group": group, "title": group})
+        elif self.smart:
             info = parse_media(parse_name or fname)
             if info is None:
                 return None
@@ -409,6 +432,8 @@ def default_rules():
              "Images/{year}"),
         Rule("Videos", True, VID, "", "", 0, 0, 0, "Videos"),
         Rule("Audio", True, "mp3, wav, flac, m4a, aac, ogg", "", "", 0, 0, 0, "Audio"),
+        Rule("Related archives -> own folder", True, "", "", "", 0, 0, 0, "Archives/{group}",
+             kind="archive", smart="group"),
         Rule("Archives", True, "zip, rar, 7z, tar, gz, bz2", "", "", 0, 0, 0, "Archives"),
         Rule("Code & data", True, "py, js, ts, json, html, css, sql, ipynb", "", "", 0, 0, 0, "Code"),
         Rule("By content (odd or missing extensions)", True, "", "", "", 0, 0, 0, "By Content/{kind}",
@@ -486,6 +511,7 @@ class Sorter:
         self._settled = set()    # files already evaluated that need no move: (path, size, mtime_ns)
         self._sig = None
         self._claimed = {}
+        self._dircache = {}
 
     def invalidate(self):
         self._indexes.clear()
@@ -610,15 +636,19 @@ class Sorter:
 
     def _apply_aliases(self, groups: dict) -> dict:
         """'Nanatsu no Taizai = The Seven Deadly Sins' renames the detected title."""
-        if "title" not in groups:
+        base = groups.get("title") or groups.get("group")
+        if not base:
             return groups
-        key = norm_key(groups["title"])
+        key = norm_key(base)
         for k, name in self._alias_pairs():
             if k in key:
                 g = dict(groups)
-                g["title"] = name
-                y = g.get("title_year")
-                g["movie"] = f"{name} ({y})" if y else name
+                for field_name in ("title", "group"):
+                    if field_name in g:
+                        g[field_name] = name
+                if "movie" in g:
+                    y = g.get("title_year")
+                    g["movie"] = f"{name} ({y})" if y else name
                 return g
         return groups
 
@@ -659,6 +689,71 @@ class Sorter:
                     hints[path] = f"{base} - {n:02d}{os.path.splitext(path)[1]}"
         return hints
 
+    def _name_groups(self, cands) -> dict:
+        """path -> shared name, for files in the same folder that belong together:
+        1) identical family name ('Report.zip', 'Report (1).zip', 'Report part2.rar')
+        2) otherwise a shared leading name ('ProjectX_data.zip' + 'ProjectX_logs.zip' -> 'ProjectX');
+           a one-word prefix must be 6+ letters so 'Final Cut Pro' and 'Final Fantasy' stay apart."""
+        by_dir = {}
+        for path, name, _info, _parent in cands:
+            core = group_core(name)
+            if len(norm_key(core)) >= 3:
+                by_dir.setdefault(str(Path(path).parent), []).append((path, core))
+        out = {}
+        for items in by_dir.values():
+            same = {}
+            for path, core in sorted(items):
+                same.setdefault(norm_key(core), []).append((path, core))
+            units = [(lst[0][1], [pth for pth, _ in lst]) for lst in same.values()]
+            for core, paths in units:
+                if len(paths) >= 2:
+                    for pth in paths:
+                        out[pth] = core
+            prefixes = {}
+            for ui, (core, _paths) in enumerate(units):
+                toks = core.split()
+                for k in range(1, len(toks) + 1):
+                    disp = " ".join(toks[:k])
+                    pk = norm_key(disp)
+                    if len(pk) >= 4 and (len(pk) >= 6 or k >= 2):
+                        prefixes.setdefault(pk, []).append((ui, disp))
+            done = set()
+            for pk in sorted(prefixes, key=len):  # shortest shared prefix first = coarsest folders
+                members = [m for m in prefixes[pk] if m[0] not in done]
+                if len(members) >= 2:
+                    for ui, _disp in members:
+                        for pth in units[ui][1]:
+                            out[pth] = members[0][1]
+                        done.add(ui)
+        return out
+
+    def _late_group(self, base: Path, rule: Rule, name: str) -> str:
+        """A lone file whose family already has a folder (created earlier) joins that folder."""
+        core = group_core(name)
+        ck = norm_key(core)
+        if len(ck) < 3 or "{group}" not in rule.target:
+            return ""
+        before = rule.target.split("{group}")[0]
+        if "{" in before or (before and not before.endswith(("/", "\\"))):
+            return ""
+        parts = [safe_part(x) for x in re.split(r"[\\/]+", before)]
+        parent = base.joinpath(*[x for x in parts if x]) if any(parts) else base
+        names = self._dircache.get(str(parent))
+        if names is None:
+            try:
+                with os.scandir(parent) as it:
+                    names = [e.name for e in it if e.is_dir()]
+            except OSError:
+                names = []
+            self._dircache[str(parent)] = names
+        best = ""
+        for n in names:
+            k = norm_key(n)
+            if len(k) >= 3 and (ck == k or (ck.startswith(k) and (len(k) >= 6 or " " in n.strip()))):
+                if len(k) > len(norm_key(best)):
+                    best = n
+        return best
+
     # -- planning ----------------------------------------------------------
     def _iter_files(self, root: Path, depth: int):
         skip = {"$recycle.bin", "system volume information", DUP_FOLDER.lower()}
@@ -690,6 +785,7 @@ class Sorter:
             if len(self._settled) > 200000:
                 self._settled.clear()
             self._claimed = {}
+            self._dircache = {}
             out = []
             for f in self.cfg.settings.folders:
                 if f.enabled and f.path and Path(f.path).is_dir():
@@ -722,6 +818,7 @@ class Sorter:
 
         dups = self._find_duplicates(root, cands) if st.duplicate_mode == "move" else set()
         hints = self._cluster_hints(cands)
+        bgroups = self._name_groups(cands) if any(r.smart == "group" for r in rules) else {}
         for path, name, info, parent_name in cands:
             key = (path, info.st_size, info.st_mtime_ns)
             if path in dups:
@@ -730,7 +827,10 @@ class Sorter:
             parse_name = hints.get(path) or self._effective_name(name, parent_name)
             dest, rule_name, action = None, "", "move"
             for r in rules:
-                g = r.match(name, info.st_size, info.st_mtime, path, parse_name)
+                grp = ""
+                if r.smart == "group":
+                    grp = bgroups.get(path) or self._late_group(base, r, name)
+                g = r.match(name, info.st_size, info.st_mtime, path, parse_name, grp)
                 if g is not None:
                     dest = self._dest_dir(base, r, path, name, info.st_mtime, g)
                     rule_name, action = r.name, r.action
@@ -764,7 +864,8 @@ class Sorter:
             for r in self.cfg.rules:
                 if not (r.enabled and r.target.strip()):
                     continue
-                g = r.match(fname, 50 * 1048576, now, fname)
+                g = r.match(fname, 50 * 1048576, now, fname, "",
+                            group_core(fname) if r.smart == "group" else "")
                 if g is not None:
                     dest = self._dest_dir(base, r, fname, fname, now, g)
                     if r.action == "zip":
@@ -971,18 +1072,19 @@ class RuleDialog(ctk.CTkToplevel):
         ("min_mb", "Minimum size (MB)", "0 = no limit"),
         ("max_mb", "Maximum size (MB)", "0 = no limit"),
         ("older_days", "Older than (days)", "0 = ignore age"),
-        ("target", "Destination (folder, or ZIP name for ZIP action)", "TV Series/{series}"),
+        ("target", "Destination folder  (click a chip below to insert a placeholder)", "Archives/{group}"),
     ]
     ACTIONS = ("Move to folder", "Add to ZIP archive")
     SMARTS = (("Off", ""),
               ("TV episode  (S01E02, 1x02, Season 1…)", "series"),
               ("Movie  (has a year or quality tags)", "movie"),
-              ("Any title  (group by cleaned name)", "title"))
+              ("Any title  (group by cleaned name)", "title"),
+              ("Shared name  (files that belong together, e.g. archives)", "group"))
 
     def __init__(self, parent, rule: Rule, on_save):
         super().__init__(parent)
         self.title("Edit rule")
-        self.geometry("620x900")
+        self.geometry("640x960")
         self.configure(fg_color=BG)
         self.transient(parent)
         self.after(80, self.grab_set)
@@ -1004,6 +1106,13 @@ class RuleDialog(ctk.CTkToplevel):
             if val not in ("", 0, 0.0):
                 e.insert(0, str(val))
             self.entries[key] = e
+            if key == "target":
+                chips = ctk.CTkFrame(body, fg_color="transparent")
+                chips.pack(fill="x", padx=12, pady=(6, 0))
+                for tok in ("{group}", "{title}", "{season}", "{movie}", "{year}", "{ext}", "{kind}"):
+                    ctk.CTkButton(chips, text=tok, width=10, height=26, corner_radius=8, fg_color="#232839",
+                                  hover_color=ACCENT, font=ctk.CTkFont(size=12),
+                                  command=lambda t=tok, en=e: en.insert("insert", t)).pack(side="left", padx=(0, 6))
 
         ctk.CTkLabel(body, text="Smart name pattern - groups related files by the title in their name",
                      text_color=MUTED, font=ctk.CTkFont(size=12)).pack(anchor="w", padx=12, pady=(16, 2))
@@ -1025,9 +1134,14 @@ class RuleDialog(ctk.CTkToplevel):
                           button_color=ACCENT, button_hover_color=ACCENT_HOVER, height=36).pack(
             anchor="w", padx=12)
 
-        hint = ("Smart name placeholders: {title} {movie} {title_year} {season} {episode}\n"
-                "e.g. TV Series/{title}/{season}  or  Movies/{movie}. Videos and their subtitles\n"
-                "share a title, so they land together whatever their extension.\n\n"
+        hint = ("Naming the destination - mix fixed text and placeholders:\n"
+                "  Archives/{group}             folder named after the shared name (Shared name mode)\n"
+                "  TV Series/{title}/{season}   Movies/{movie}   Documents/{year}/{ext}\n"
+                "  Backups/{group} files        fixed text before/after a placeholder is fine\n\n"
+                "Smart placeholders: {group} {title} {movie} {title_year} {season} {episode}.\n"
+                "Shared name mode groups Report.zip, Report (1).zip, Report.part2.rar (identical\n"
+                "family name) and ProjectX_data.zip + ProjectX_logs.zip (shared start), and drops\n"
+                "copy markers, part/volume numbers, versions and dates from the folder name.\n\n"
                 "Placeholders: {ext} {kind} {year} {month} {month_name} {first_letter}\n"
                 "{name_year} {name_month} {name_day} (date in the file name) and any regex named\n"
                 "group like (?P<series>…) → {series}. Use / for sub-folders.\n"
@@ -1114,6 +1228,9 @@ class NameTester(ctk.CTkToplevel):
             lines.append("Detected   " + "   ·   ".join(bits))
         else:
             lines.append("Detected   no usable title")
+        gc = group_core(name)
+        if gc:
+            lines.append(f"Group name   {gc}   (used by 'Shared name' rules)")
         res = self.app.sorter.explain(name)
         if res:
             lines.append(f"\nRule           {res[0]}\nGoes to       {res[1]}")

@@ -270,3 +270,60 @@ def test_legacy_single_root_config_is_migrated(tmp_path, monkeypatch):
     cfg = d.load_config()
     assert [f.path for f in cfg.settings.folders] == [str(tmp_path / "old")]
     assert cfg.settings.root == ""
+
+
+# ---- shared-name grouping (e.g. archives) ------------------------------------
+@pytest.mark.parametrize("name,core", [
+    ("MyGame.part1.rar", "MyGame"), ("MyGame (1).zip", "MyGame"), ("MyGame_v1.2.zip", "MyGame"),
+    ("Photos_2023.zip", "Photos"), ("Photos-2024-03-15.zip", "Photos"), ("Report copy.zip", "Report"),
+    ("backup.tar.gz", "backup"), ("Windows 10 Pro.iso", "Windows 10 Pro"),
+])
+def test_group_core(name, core):
+    assert d.group_core(name) == core
+
+
+def test_similar_archives_get_their_own_folder(env):
+    root, cfg, s = env
+    for n in ("MyGame.part1.rar", "MyGame.part2.rar", "MyGame (1).zip",
+              "Photos_2023.zip", "Photos_2024.zip",
+              "ProjectX_report.zip", "ProjectX_data.zip", "solo.zip"):
+        make(root, n)
+    r = dests(s)
+    assert {r["MyGame.part1.rar"], r["MyGame.part2.rar"], r["MyGame (1).zip"]} == {"Archives/MyGame"}
+    assert {r["Photos_2023.zip"], r["Photos_2024.zip"]} == {"Archives/Photos"}
+    assert {r["ProjectX_report.zip"], r["ProjectX_data.zip"]} == {"Archives/ProjectX"}
+    assert r["solo.zip"] == "Archives"
+
+
+def test_short_unrelated_prefixes_do_not_group(env):
+    root, cfg, s = env
+    make(root, "Final Cut Pro.zip")
+    make(root, "Final Fantasy.zip")
+    assert set(dests(s).values()) == {"Archives"}
+
+
+def test_late_archive_joins_existing_group_folder(env):
+    root, cfg, s = env
+    (root / "Archives" / "ProjectX").mkdir(parents=True)
+    make(root, "ProjectX_logs.zip")
+    make(root, "Other.zip")
+    r = dests(s)
+    assert r["ProjectX_logs.zip"] == "Archives/ProjectX"
+    assert r["Other.zip"] == "Archives"
+
+
+def test_group_placeholder_with_text_and_alias(env):
+    root, cfg, s = env
+    cfg.rules.insert(0, d.Rule("grp", True, "zip", target="Packs/{group} files", smart="group"))
+    cfg.settings.aliases = "Photos = Picture backups"
+    for n in ("Photos_2023.zip", "Photos_2024.zip", "Tools.zip", "Tools (1).zip"):
+        make(root, n)
+    r = dests(s)
+    assert r["Photos_2023.zip"] == "Packs/Picture backups files"
+    assert r["Tools.zip"] == "Packs/Tools files"
+
+
+def test_explain_shows_group_name(env):
+    _, _, s = env
+    rule, dest = s.explain("MyGame.part1.rar")
+    assert "archives" in rule.lower() and dest.endswith("Archives/MyGame/")

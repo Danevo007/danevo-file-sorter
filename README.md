@@ -62,7 +62,7 @@ Rules are checked top to bottom; the first enabled rule that matches a file deci
 |---|---|
 | Extensions | `pdf, docx, xlsx` |
 | Content type | `image, video, subtitle, archive…` (sniffed from the file when the extension is unknown) |
-| Smart name pattern | TV episode · movie · any title |
+| Smart name pattern | TV episode · movie · any title · shared name |
 | Name contains | `invoice, receipt` |
 | Regex | `^(?P<client>.+?)_invoice` -> `{client}` |
 | Date in name | `IMG-20240315-WA0001.jpg` -> `{name_year}/{name_month}` |
@@ -71,6 +71,26 @@ Rules are checked top to bottom; the first enabled rule that matches a file deci
 Destinations are folders inside the watched folder (or absolute paths), e.g. `TV Series/{title}/{season}`.
 A rule can also **add to a ZIP** instead of moving (destination `Old Files/{year}` -> `Old Files/2026.zip`).
 Existing folders are reused even when their casing or punctuation differs (`breaking bad` = `Breaking.Bad`).
+
+### Naming the destination folder
+
+The destination is plain text mixed with placeholders - click the chips under the box in the rule editor to insert them.
+
+| You type | You get |
+|---|---|
+| `Archives/{group}` | one folder per family of similar names (Shared name mode) |
+| `TV Series/{title}/{season}` | `TV Series/Breaking Bad/Season 02` |
+| `Movies/{movie}` | `Movies/Inception (2010)` |
+| `Backups/{group} files` | `Backups/MyGame files` (fixed text around a placeholder is fine) |
+| `Documents/{year}/{ext}` | `Documents/2026/PDF` |
+
+**Shared name** mode groups files that belong together, for example archives:
+- identical family name: `MyGame.part1.rar`, `MyGame.part2.rar`, `MyGame (1).zip`, `MyGame_v1.2.zip` -> `MyGame`
+- shared start: `ProjectX_data.zip` + `ProjectX_logs.zip` -> `ProjectX` (a one-word prefix needs 6+ letters, so
+  `Final Cut Pro` and `Final Fantasy` are not mixed up)
+- copy markers, part/volume numbers, versions and trailing dates are dropped from the folder name
+- a lone file whose family folder already exists joins it (`ProjectX_logs.zip` -> existing `Archives/ProjectX`)
+- title aliases also rename groups, and a file with no partner falls through to the next rule
 
 Name-based grouping details:
 - Episodes with no season marker (`Title - 05`) default to `Season 01`; edit the destination to
@@ -86,7 +106,7 @@ Settings and rules live in `~/.danevo_file_sorter/` (`config.json`, `history.jso
 ## Build the Windows app
 
 See [BUILDING.md](BUILDING.md) for the one-click `build.bat`, the Inno Setup installer, and troubleshooting.
-Pushing a version tag (`git tag v1.2.0 && git push origin v1.2.0`) builds and publishes both automatically
+Pushing a version tag (`git tag v1.3.0 && git push origin v1.3.0`) builds and publishes both automatically
 through GitHub Actions.
 
 ## Development

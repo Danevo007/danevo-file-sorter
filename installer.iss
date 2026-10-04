@@ -1,7 +1,7 @@
 ; Inno Setup script - https://jrsoftware.org/isinfo.php
 ; Run build.bat first (onedir mode), then open this file in Inno Setup and click Compile.
 #define MyAppName "Danevo File Sorter"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.3.0"
 #define MyAppExe "Danevo File Sorter.exe"
 
 [Setup]

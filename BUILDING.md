@@ -23,7 +23,7 @@ false-positives. One-file is easier to share but unpacks itself on every launch 
 ## 2. Make a proper installer (recommended for sharing)
 1. Install Inno Setup (free): https://jrsoftware.org/isinfo.php
 2. Run `build.bat` (folder mode), open `installer.iss`, press **Compile** (Ctrl+F9).
-3. You get `installer\DanevoFileSorter-Setup-1.2.0.exe` with Start-menu entry, optional
+3. You get `installer\DanevoFileSorter-Setup-1.3.0.exe` with Start-menu entry, optional
    desktop shortcut, optional "start with Windows", and a clean uninstaller.
    It installs per-user, so no admin rights are needed.
 
